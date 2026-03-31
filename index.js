@@ -1,275 +1,309 @@
 // Wrapping the whole extension in a JS function 
 // (ensures all global variables set in this extension cannot be referenced outside its scope)
-(async function(codioIDE, window) {
-  
-  // Refer to Anthropic's guide on system prompts here: https://docs.anthropic.com/claude/docs/system-prompts
-  const systemPrompt = "You are a helpful assistant."
-  
-  // register(id: unique button id, name: name of button visible in Coach, function: function to call when button is clicked) 
-  codioIDE.coachBot.register("translateContentButton", "Translate the assignment for me please!", onButtonPress)
+(async function (codioIDE, window) {
+  const SOURCE_LANGUAGE = "English";
+  const TARGET_LANGUAGE = "German";
+  const TARGET_LANGUAGE_LABEL = "Deutsch";
 
-  // function called when I have a question button is pressed
+  const BUTTON_ID = "translateGuidesToGermanButton";
+  const BUTTON_LABEL = "Translate this assignment into German";
+  const CHAPTER_TITLE = "Deutsch";
+  const TRANSLATED_PAGE_PREFIX = "[DE] ";
+
+  // Only create translated sidecar files for clearly text-based files.
+  // Leaving executable/source files alone avoids breaking activities.
+  const TRANSLATABLE_TEXT_FILE_EXTENSIONS = new Set([
+    ".md",
+    ".markdown",
+    ".txt"
+  ]);
+
+  const systemPrompt = `
+You are a precise localization assistant for Codio course content.
+Translate learner-facing English text into natural German.
+Preserve anything that must remain machine-usable or executable.
+Do not add explanations, commentary, or extra content.
+Return only the requested XML tag contents.
+  `.trim();
+
+  codioIDE.coachBot.register(BUTTON_ID, BUTTON_LABEL, onButtonPress);
+
   async function onButtonPress() {
-    
-    // let variable_name  //const variable_name     //var variable_name
-    // Let's add a chapter first for the translated content
-    let chapter_res
     try {
-        chapter_res = await window.codioIDE.guides.structure.add({
-            title: 'Javascript', 
-            type: window.codioIDE.guides.structure.ITEM_TYPES.CHAPTER
-        })
-        console.log('Chapter added ->', chapter_res) // returns added item: {id: '...', title: '...', type: '...', children: [...]}
-    } catch (e) {
-        console.error(e)
+      codioIDE.coachBot.write("Collecting Guides pages for German translation...");
+
+      // Pull the structure BEFORE adding a new chapter so we do not re-process
+      // any translated content created during this run.
+      const structure = await window.codioIDE.guides.structure.getStructure();
+      const pages = findPages(structure).filter((page) => !isTranslatedTitle(page.title));
+
+      if (!pages.length) {
+        codioIDE.coachBot.write("No untranslated Guides pages were found.");
+        return;
+      }
+
+      const chapterResult = await window.codioIDE.guides.structure.add({
+        title: CHAPTER_TITLE,
+        type: window.codioIDE.guides.structure.ITEM_TYPES.CHAPTER
+      });
+
+      codioIDE.coachBot.write(`Created "${CHAPTER_TITLE}" chapter in Guides.`);
+
+      for (let index = 0; index < pages.length; index++) {
+        const page = pages[index];
+        const pageData = await codioIDE.guides.structure.get(page.id);
+        const settings = pageData?.settings || {};
+        const originalTitle = page.title || `Page ${index + 1}`;
+        const originalContent = settings.content || "";
+        const originalActions = Array.isArray(settings.actions) ? [...settings.actions] : [];
+
+        codioIDE.coachBot.write(
+          `Translating "${originalTitle}" (${index + 1}/${pages.length})...`
+        );
+
+        const translatedTitle = await translatePageTitle(originalTitle);
+        const translatedContent = await translateGuideContent(originalContent, originalTitle);
+        const translatedActions = await maybeTranslateOpenTextFile(originalActions);
+
+        await window.codioIDE.guides.structure.add(
+          {
+            type: window.codioIDE.guides.structure.ITEM_TYPES.PAGE,
+            title: `${TRANSLATED_PAGE_PREFIX}${translatedTitle}`,
+            content: translatedContent,
+            layout: settings.layout,
+            closeTerminalSession: settings.closeTerminalSession,
+            closeAllTabs: settings.closeAllTabs,
+            showFileTree: settings.showFileTree,
+            actions: translatedActions
+          },
+          chapterResult.id,
+          index + 1
+        );
+
+        codioIDE.coachBot.write(`Finished "${originalTitle}".`);
+      }
+
+      codioIDE.coachBot.write("German translation complete.");
+    } catch (error) {
+      console.error(error);
+      codioIDE.coachBot.write(`Translation failed: ${error.message || error}`);
+    } finally {
+      codioIDE.coachBot.showMenu();
     }
-    
-    codioIDE.coachBot.write(`Created new Chapter in Guides to add all translated pages!`)
+  }
 
-    // get guides structure for page names and order
-    let structure
-    try {
-        structure = await window.codioIDE.guides.structure.getStructure()
-        console.log("This is the Guides structure", structure)
-    } catch (e) {
-        console.error(e)
+  function findPages(node) {
+    if (!node || typeof node !== "object") {
+      return [];
     }
 
-    // filter out everything else and onlt keep guide elements of type: page
-    const findPagesFilter = (obj) => {
-        if (!obj || typeof obj !== 'object') return [];
-        
-        return [
-            ...(obj.type === 'page' ? [obj] : []),
-            ...Object.values(obj).flatMap(findPagesFilter)
-        ];
-    };
-
-    const pages = findPagesFilter(structure)
-    console.log("pages", pages)
-
-    let guidePages = {}
-
-    // iterate through page ids of pages and fetch all page data
-    for ( const element_index in pages) {
-      
-      // console.log("element", element)
-      let page_id = pages[element_index].id
-      // console.log("page id", page_id)
-      let pageData = await codioIDE.guides.structure.get(page_id)
-      // console.log("pageData", pageData)
-      guidePages[element_index] = {"title": pages[element_index].title, "id": page_id, "content": pageData.settings.content, "settings": pageData.settings};
+    const pages = [];
+    if (node.type === "page") {
+      pages.push(node);
     }
 
-    console.log("guide pages", guidePages)
+    for (const value of Object.values(node)) {
+      pages.push(...findPages(value));
+    }
 
-    // Define all variables and prompt for API calls
-    const ORIGINAL_LANGUAGE = "Java"
-    const NEW_LANGUAGE = "Javascript"
+    return pages;
+  }
 
-    const contentUserPrompt = `
-    You are an AI assistant with expertise in translating instructional materials from one programming language to another. Your task is to translate the given content while maintaining the same concepts and structure, only changing the programming language-specific elements.
+  function isTranslatedTitle(title) {
+    return typeof title === "string" && title.trim().startsWith(TRANSLATED_PAGE_PREFIX);
+  }
 
-Here is the original content to be translated:
+  async function translatePageTitle(title) {
+    const prompt = `
+Translate this Codio Guides page title from ${SOURCE_LANGUAGE} to ${TARGET_LANGUAGE}.
+
+Rules:
+1. Translate naturally into German.
+2. Do not add quotation marks.
+3. Do not add a prefix like [DE]; that is handled separately.
+4. Return only the translated title inside <translated_title> tags.
+
+<original_title>
+${title}
+</original_title>
+
+<translated_title>
+    `.trim();
+
+    const translated = await askAndExtractXmlTag(prompt, "translated_title");
+    return translated || title;
+  }
+
+  async function translateGuideContent(content, pageTitle) {
+    if (!content || !content.trim()) {
+      return content;
+    }
+
+    const prompt = `
+Translate the following Codio Guides page from ${SOURCE_LANGUAGE} to ${TARGET_LANGUAGE}.
+
+Page title:
+${pageTitle}
+
+Rules:
+1. Translate all learner-facing prose into German.
+2. Preserve Markdown structure exactly.
+3. Preserve HTML structure and attributes exactly.
+4. Preserve URLs, image paths, file paths, placeholders, variables, macros, and template syntax exactly.
+5. Preserve fenced code blocks, inline code, commands, package names, API names, filenames, and source code exactly.
+6. Translate visible link text, headings, paragraphs, bullet text, table text, and callout text where safe.
+7. Do not add explanations, notes, or extra content.
+8. Return only the translated page inside <translated_content> tags.
+
 <original_content>
-{ORIGINAL_CONTENT}
+${content}
 </original_content>
 
-The original programming language is ${ORIGINAL_LANGUAGE}, and you need to translate it to ${NEW_LANGUAGE}.
-
-Follow these guidelines for the translation:
-1. Keep all the content and concepts covered in the original material the same.
-2. Only modify programming language-specific elements to ensure correctness in the new language.
-3. Maintain the overall structure and flow of the instructional material.
-4. Adapt code examples, syntax, and language-specific terminology to the new programming language.
-5. Ensure that explanations and comments are updated to reflect the new language's conventions and best practices.
-6. Do not add any explanations, additional comments, or extra functionality that wasn't present in the original content.
-7. If there are any portions of the code that cannot be directly translated due to language limitations, provide the closest equivalent functionality and include a comment explaining the adaptation.
-8. If there is a {Try It} button command on the page:
-    - Make sure the filepath in the command starts with code/ 
-    - Change the filename formatting in the provided filepath as per Javascript naming conventions.
-    - Also change the extension to .js. Do not change the filepath. It should still be in the same directory structure.
-
-
-When handling specific elements:
-- Keep all image links exactly the same.
-- For code file links, keep the filename the same but update the file extension to match the new programming language.
-
-Please provide the translated content, ensuring that it accurately reflects the original material while being correctly adapted to ${NEW_LANGUAGE}. 
-Present your translation in the following format:
-
 <translated_content>
-[Your translated content goes here]
-</translated_content>
+    `.trim();
 
-Remember to maintain the educational value and clarity of the original content throughout your translation. 
-It should also follow markdown formatting.
-    `
-
-    const codeFileUserPrompt = `
-    You are tasked with translating a code file from one programming language to another. Your goal is to produce an accurate translation that retains all the original information without adding anything extra. 
-    Follow these instructions carefully:
-
-The original programming language is ${ORIGINAL_LANGUAGE}, and you need to translate it to ${NEW_LANGUAGE}.
-
-Here is the code file to be translated:
-<code_file>
-{CODE_FILE}
-</code_file>
-
-Before translating, think through how you will translate and structure the page in a <scratchpad>
-section.
-
-Translation process:
-   a. Carefully read and understand the entire code page.
-   b. Identify the main components, functions, and logic of the code.
-   c. Translate each component into the target language, ensuring that the functionality and logic remain identical.
-   d. Maintain the original structure and organization of the code as much as possible.
-   e. Preserve all comments, translating them if necessary while keeping their original meaning.
-   f. Ensure that variable names, function names, and other identifiers are translated appropriately if they contain language-specific words.
-   h. Adapt any language-specific idioms or constructs to their equivalent in the target language.
-   i. Double-check that all syntax is correct for the target language.
-
-Output requirements:
-   a. Provide the translated code inside <translated_code> tags.
-   b. Ensure the translated code is properly formatted and indented for readability.
-   c. Do not add any explanations, additional comments, or extra functionality that wasn't present in the original code.
-   d. If there are any portions of the code that cannot be directly translated due to language limitations, provide the closest equivalent functionality and include a comment explaining the adaptation.
-
-Begin your translation now, and remember to focus solely on accurate translation without adding any extra information or functionality.
-`
-
-    const fileRenamingPrompt = `You are a helpful assistant with expertise in Javascript naming conventions.
-            Here is the filepath for a Java file:
-            <filepath> 
-            {openFilePath}
-            </filepath>. 
-            Your task is to change the filename formatting in the provided filepath as per Javascript file naming conventions in kebab-case.
-            Change any java specific filenames to its Javascript equivalent. Also change the extension to .js. Do not change the filepath. It should still be in the same directory structure.
-            Provide the updated filepath in the <updated_filepath> tags.`
-
-    // iterate through guidePages for translation
-    for (const [pageIndex, pageData] of Object.entries(guidePages)) {
-        console.log(`${pageIndex}: ${pageData.title}`)
-        
-        // variables that may or may not be defined based on page layout
-        let codeFile
-        let openFilePath
-
-        // pageData and settings that we want to translate and persist
-        const pageLayout = pageData.settings.layout
-        const closeAllTabs = pageData.settings.closeAllTabs
-        const showFileTree = pageData.settings.showFileTree
-        const closeTerminalSession = pageData.settings.closeTerminalSession
-        const pageContent = pageData.content
-        let actions = pageData.settings.actions
-
-        // if layout is not 1 panel, then check for open file in left panel
-        if (pageLayout != "1-panel") {
-
-            openFilePath = pageData.settings.actions[0].fileName
-
-            // check if open file is a .java file
-            if (typeof(openFilePath) != "undefined") {
-                if (openFilePath.endsWith(".java")) {
-                    console.log("this should be the java file that's open with this page", `${pageData.settings.actions[0].fileName}`)
-                    // fetch file content
-                    codeFile = await codioIDE.files.getContent(openFilePath)
-                }
-            }
-        }
-
-        codioIDE.coachBot.write(`Translating page on ${pageData.title} at index ${pageIndex}... please wait...`)
-        var updatedContentPrompt = contentUserPrompt.replace('{ORIGINAL_CONTENT}', pageContent)
-        
-        // function that takes in the userPrompt and extraction xml tag, returns the translation result
-        async function fetchLLMResponseXMLTagContents(userPrompt, xml_tag) {
-
-            // Send the API request to the LLM with page content
-            const result = await codioIDE.coachBot.ask(
-                {
-                    systemPrompt: systemPrompt,
-                    messages: [{
-                        "role": "user", 
-                        "content": userPrompt
-                    }]
-                }, {stream:false, preventMenu: true}
-            )
-
-            // console.log("API request result", result.result)
-            
-            const startIndex = result.result.indexOf(`<${xml_tag}>`) + `<${xml_tag}>`.length
-            const endIndex = result.result.lastIndexOf(`</${xml_tag}>`);
-
-            if (endIndex == -1) {
-                return result.result
-            } else {
-                return result.result.substring(startIndex, endIndex);
-            }
-        }
-
-        // fetch translated content
-        const translatedContent = await fetchLLMResponseXMLTagContents(updatedContentPrompt, "translated_content")
-        // console.log("content translation result", translatedContent)
-
-        let translatedCodeFile
-
-        // if codeFile exists, fetch translated code file
-        if (codeFile) {
-            var updatedCodeFilePrompt = codeFileUserPrompt.replace('{CODE_FILE}', codeFile)
-            translatedCodeFile = await fetchLLMResponseXMLTagContents(updatedCodeFilePrompt, "translated_code")
-
-            // const fileAddRes = await codioIDE.files.add(filepath, fileContents)
-            // console.log("code file translation result", translatedCodeFile)
-
-            var updatedFileRenamingPrompt = fileRenamingPrompt.replace('{openFilePath}', openFilePath)
-            var updatedFileName = await fetchLLMResponseXMLTagContents(updatedFileRenamingPrompt, "updated_filepath")
-            // console.log("filename translation result", updatedFileName)
-        }
-
-        const newMarkdownPage = `${translatedContent}
-        
-        // filepath/filename
-        ${updatedFileName}
-
-        // This is the content for the code file in the left panel 
-        ${translatedCodeFile}
-        
-        `
-        console.log("final page", newMarkdownPage)
-
-        // add new page, with translated content, and preserve old layout and settings
-        try {
-
-            if (codeFile) {
-                actions = [{type: 'file', panel: undefined, fileName: `${updatedFileName}`}]
-            }
-
-            const page_res = await window.codioIDE.guides.structure.add({
-                type: window.codioIDE.guides.structure.ITEM_TYPES.PAGE,
-                title: `${pageData.title}`, 
-                content: `${newMarkdownPage}`,
-                layout: pageLayout,
-                closeTerminalSession: closeTerminalSession,
-                closeAllTabs: closeAllTabs,
-                showFileTree: showFileTree,
-                actions: actions
-            }, `${chapter_res.id}`, pageIndex+1)
-            codioIDE.coachBot.write(`${pageData.title} Translation complete!! 🐣`)
-            console.log('add item result', page_res) // returns added item: {id: '...', title: '...', type: '...', children: [...]}
-        } catch (e) {
-            console.error(e)
-        }
-
-    }
-//   e. Rate the translation on a scale of 1 to 5. (1 being poor and 5 being excellent.) in a <rating> tag
-//    g. Finally, provide translation rating explanations in a <rating_explanation> tag
-    codioIDE.coachBot.showMenu()
+    const translated = await askAndExtractXmlTag(prompt, "translated_content");
+    return translated || content;
   }
-// calling the function immediately by passing the required variables
-})(window.codioIDE, window)
 
- 
+  async function maybeTranslateOpenTextFile(actions) {
+    const fileActionIndex = actions.findIndex(
+      (action) =>
+        action &&
+        action.type === "file" &&
+        typeof action.fileName === "string" &&
+        action.fileName.trim() !== ""
+    );
 
-  
-  
+    if (fileActionIndex === -1) {
+      return actions;
+    }
+
+    const sourcePath = actions[fileActionIndex].fileName;
+
+    if (!isTranslatableTextFile(sourcePath)) {
+      return actions;
+    }
+
+    try {
+      const sourceContent = await codioIDE.files.getContent(sourcePath);
+      const translatedContent = await translateTextFile(sourceContent, sourcePath);
+      const translatedPath = buildTranslatedFilePath(sourcePath);
+
+      try {
+        await codioIDE.files.add(translatedPath, translatedContent);
+      } catch (addError) {
+        // If the file already exists, keep going and just point the page action at it.
+        console.warn(`Could not create translated file at ${translatedPath}:`, addError);
+      }
+
+      const updatedActions = [...actions];
+      updatedActions[fileActionIndex] = {
+        ...updatedActions[fileActionIndex],
+        fileName: translatedPath
+      };
+
+      return updatedActions;
+    } catch (fileError) {
+      console.warn(`Could not translate open text file "${sourcePath}":`, fileError);
+      return actions;
+    }
+  }
+
+  async function translateTextFile(content, filePath) {
+    if (!content || !content.trim()) {
+      return content;
+    }
+
+    const prompt = `
+Translate this text-based file from ${SOURCE_LANGUAGE} to ${TARGET_LANGUAGE}.
+
+File path:
+${filePath}
+
+Rules:
+1. Translate learner-facing text into German.
+2. Preserve Markdown structure exactly.
+3. Preserve fenced code blocks, inline code, commands, URLs, placeholders, variables, and filenames exactly.
+4. Do not add explanations, notes, or extra content.
+5. Return only the translated file contents inside <translated_file> tags.
+
+<original_file>
+${content}
+</original_file>
+
+<translated_file>
+    `.trim();
+
+    const translated = await askAndExtractXmlTag(prompt, "translated_file");
+    return translated || content;
+  }
+
+  async function askAndExtractXmlTag(userPrompt, xmlTag) {
+    const result = await codioIDE.coachBot.ask(
+      {
+        systemPrompt,
+        messages: [
+          {
+            role: "user",
+            content: userPrompt
+          }
+        ]
+      },
+      {
+        stream: false,
+        preventMenu: true
+      }
+    );
+
+    const raw = result?.result || "";
+    return extractXmlTagContents(raw, xmlTag).trim();
+  }
+
+  function extractXmlTagContents(text, tagName) {
+    const startTag = `<${tagName}>`;
+    const endTag = `</${tagName}>`;
+
+    const startIndex = text.indexOf(startTag);
+    const endIndex = text.lastIndexOf(endTag);
+
+    if (startIndex === -1 || endIndex === -1 || endIndex <= startIndex) {
+      return text;
+    }
+
+    return text.substring(startIndex + startTag.length, endIndex);
+  }
+
+  function isTranslatableTextFile(filePath) {
+    const extension = getFileExtension(filePath);
+    return TRANSLATABLE_TEXT_FILE_EXTENSIONS.has(extension);
+  }
+
+  function getFileExtension(filePath) {
+    const fileName = filePath.split("/").pop() || "";
+    const lastDot = fileName.lastIndexOf(".");
+    if (lastDot === -1) {
+      return "";
+    }
+    return fileName.slice(lastDot).toLowerCase();
+  }
+
+  function buildTranslatedFilePath(filePath) {
+    const lastSlash = filePath.lastIndexOf("/");
+    const directory = lastSlash === -1 ? "" : filePath.slice(0, lastSlash + 1);
+    const fileName = lastSlash === -1 ? filePath : filePath.slice(lastSlash + 1);
+
+    if (fileName.includes(".de.")) {
+      return filePath;
+    }
+
+    const lastDot = fileName.lastIndexOf(".");
+    if (lastDot === -1) {
+      return `${directory}${fileName}.de`;
+    }
+
+    const baseName = fileName.slice(0, lastDot);
+    const extension = fileName.slice(lastDot);
+    return `${directory}${baseName}.de${extension}`;
+  }
+})(window.codioIDE, window);
