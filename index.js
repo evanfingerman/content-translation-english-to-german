@@ -24,6 +24,9 @@ Return only the requested XML tag contents.
 
   async function onButtonPress() {
     try {
+      codioIDE.coachBot.write("NEW IN-PLACE BUILD LOADED");
+      throw new Error("NEW IN-PLACE BUILD LOADED");
+      
       codioIDE.coachBot.write("Scanning .guides files...");
 
       const allPaths = (await walk(ROOT_GUIDES_PATH)).sort();
