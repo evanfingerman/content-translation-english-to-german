@@ -1,28 +1,22 @@
-// Wrapping the whole extension in a JS function 
-// (ensures all global variables set in this extension cannot be referenced outside its scope)
 (async function (codioIDE, window) {
+  const BUTTON_ID = "translateGuidesInPlaceGerman";
+  const BUTTON_LABEL = "Translate this assignment into German";
+  const ROOT_GUIDES_PATH = ".guides";
+
   const SOURCE_LANGUAGE = "English";
   const TARGET_LANGUAGE = "German";
-  const TARGET_LANGUAGE_LABEL = "Deutsch";
 
-  const BUTTON_ID = "translateGuidesToGermanButton";
-  const BUTTON_LABEL = "Translate this assignment into German";
-  const CHAPTER_TITLE = "Deutsch";
-  const TRANSLATED_PAGE_PREFIX = "[DE] ";
+  // Safety toggle. Set to true first if you want to verify logs before writing.
+  const DRY_RUN = false;
 
-  // Only create translated sidecar files for clearly text-based files.
-  // Leaving executable/source files alone avoids breaking activities.
-  const TRANSLATABLE_TEXT_FILE_EXTENSIONS = new Set([
-    ".md",
-    ".markdown",
-    ".txt"
-  ]);
+  // Leaving this false avoids changing hidden/internal assessment names unless you decide otherwise.
+  const TRANSLATE_ASSESSMENT_SOURCE_NAME = false;
 
   const systemPrompt = `
 You are a precise localization assistant for Codio course content.
 Translate learner-facing English text into natural German.
-Preserve anything that must remain machine-usable or executable.
-Do not add explanations, commentary, or extra content.
+Preserve anything that is machine-usable, executable, structural, or an internal identifier.
+Do not add explanations, notes, or extra content.
 Return only the requested XML tag contents.
   `.trim();
 
@@ -30,60 +24,48 @@ Return only the requested XML tag contents.
 
   async function onButtonPress() {
     try {
-      codioIDE.coachBot.write("Collecting Guides pages for German translation...");
+      codioIDE.coachBot.write("Scanning .guides files...");
 
-      // Pull the structure BEFORE adding a new chapter so we do not re-process
-      // any translated content created during this run.
-      const structure = await window.codioIDE.guides.structure.getStructure();
-      const pages = findPages(structure).filter((page) => !isTranslatedTitle(page.title));
+      const allPaths = (await walk(ROOT_GUIDES_PATH)).sort();
 
-      if (!pages.length) {
-        codioIDE.coachBot.write("No untranslated Guides pages were found.");
-        return;
+      const contentJsonPaths = allPaths.filter(
+        (path) => path.startsWith(".guides/content/") && path.endsWith(".json")
+      );
+
+      const contentMarkdownPaths = allPaths.filter(
+        (path) => path.startsWith(".guides/content/") && path.endsWith(".md")
+      );
+
+      const assessmentJsonPaths = allPaths.filter(
+        (path) => path.startsWith(".guides/assessments/") && path.endsWith(".json")
+      );
+
+      codioIDE.coachBot.write(
+        `Found ${contentJsonPaths.length} content JSON files, ${contentMarkdownPaths.length} content markdown files, and ${assessmentJsonPaths.length} assessment JSON files.`
+      );
+
+      let changedFiles = 0;
+
+      for (const path of contentJsonPaths) {
+        const changed = await translateContentJsonFile(path);
+        if (changed) changedFiles += 1;
       }
 
-      const chapterResult = await window.codioIDE.guides.structure.add({
-        title: CHAPTER_TITLE,
-        type: window.codioIDE.guides.structure.ITEM_TYPES.CHAPTER
-      });
-
-      codioIDE.coachBot.write(`Created "${CHAPTER_TITLE}" chapter in Guides.`);
-
-      for (let index = 0; index < pages.length; index++) {
-        const page = pages[index];
-        const pageData = await codioIDE.guides.structure.get(page.id);
-        const settings = pageData?.settings || {};
-        const originalTitle = page.title || `Page ${index + 1}`;
-        const originalContent = settings.content || "";
-        const originalActions = Array.isArray(settings.actions) ? [...settings.actions] : [];
-
-        codioIDE.coachBot.write(
-          `Translating "${originalTitle}" (${index + 1}/${pages.length})...`
-        );
-
-        const translatedTitle = await translatePageTitle(originalTitle);
-        const translatedContent = await translateGuideContent(originalContent, originalTitle);
-        const translatedActions = await maybeTranslateOpenTextFile(originalActions);
-
-        await window.codioIDE.guides.structure.add(
-          {
-            type: window.codioIDE.guides.structure.ITEM_TYPES.PAGE,
-            title: `${TRANSLATED_PAGE_PREFIX}${translatedTitle}`,
-            content: translatedContent,
-            layout: settings.layout,
-            closeTerminalSession: settings.closeTerminalSession,
-            closeAllTabs: settings.closeAllTabs,
-            showFileTree: settings.showFileTree,
-            actions: translatedActions
-          },
-          chapterResult.id,
-          index + 1
-        );
-
-        codioIDE.coachBot.write(`Finished "${originalTitle}".`);
+      for (const path of contentMarkdownPaths) {
+        const changed = await translateMarkdownFile(path);
+        if (changed) changedFiles += 1;
       }
 
-      codioIDE.coachBot.write("German translation complete.");
+      for (const path of assessmentJsonPaths) {
+        const changed = await translateAssessmentJsonFile(path);
+        if (changed) changedFiles += 1;
+      }
+
+      codioIDE.coachBot.write(
+        DRY_RUN
+          ? `Dry run complete. ${changedFiles} files would be updated.`
+          : `Translation complete. Updated ${changedFiles} files in place.`
+      );
     } catch (error) {
       console.error(error);
       codioIDE.coachBot.write(`Translation failed: ${error.message || error}`);
@@ -92,36 +74,200 @@ Return only the requested XML tag contents.
     }
   }
 
-  function findPages(node) {
+  async function translateContentJsonFile(path) {
+    const raw = await readFile(path);
+    const data = JSON.parse(raw);
+    const original = JSON.stringify(data);
+
+    if (typeof data.title === "string" && data.title.trim()) {
+      data.title = await translateTitle(data.title, path);
+    }
+
+    if (typeof data.learningObjectives === "string" && data.learningObjectives.trim()) {
+      data.learningObjectives = await translateRichText(
+        data.learningObjectives,
+        `learning objectives in ${path}`
+      );
+    }
+
+    const updated = JSON.stringify(data);
+
+    if (updated === original) {
+      return false;
+    }
+
+    await writeJson(path, data);
+    codioIDE.coachBot.write(`Updated ${path}`);
+    return true;
+  }
+
+  async function translateMarkdownFile(path) {
+    const original = await readFile(path);
+    const translated = await translateRichText(original, `markdown file ${path}`);
+
+    if (translated === original) {
+      return false;
+    }
+
+    await writeFile(path, translated);
+    codioIDE.coachBot.write(`Updated ${path}`);
+    return true;
+  }
+
+  async function translateAssessmentJsonFile(path) {
+    const raw = await readFile(path);
+    const data = JSON.parse(raw);
+    const original = JSON.stringify(data);
+
+    await translateAssessmentNode(data, [path]);
+
+    const updated = JSON.stringify(data);
+
+    if (updated === original) {
+      return false;
+    }
+
+    await writeJson(path, data);
+    codioIDE.coachBot.write(`Updated ${path}`);
+    return true;
+  }
+
+  async function translateAssessmentNode(node, pathStack) {
+    if (Array.isArray(node)) {
+      for (let index = 0; index < node.length; index++) {
+        const value = node[index];
+        const nextPath = [...pathStack, String(index)];
+
+        if (typeof value === "string") {
+          if (shouldTranslateAssessmentString(nextPath)) {
+            node[index] = await translateRichText(value, nextPath.join("."));
+          }
+        } else if (value && typeof value === "object") {
+          await translateAssessmentNode(value, nextPath);
+        }
+      }
+      return;
+    }
+
     if (!node || typeof node !== "object") {
-      return [];
+      return;
     }
 
-    const pages = [];
-    if (node.type === "page") {
-      pages.push(node);
-    }
+    for (const [key, value] of Object.entries(node)) {
+      const nextPath = [...pathStack, key];
 
-    for (const value of Object.values(node)) {
-      pages.push(...findPages(value));
-    }
+      if (typeof value === "string") {
+        if (shouldTranslateAssessmentString(nextPath, value)) {
+          node[key] = await translateRichText(value, nextPath.join("."));
+        }
+        continue;
+      }
 
-    return pages;
+      if (value && typeof value === "object") {
+        await translateAssessmentNode(value, nextPath);
+      }
+    }
   }
 
-  function isTranslatedTitle(title) {
-    return typeof title === "string" && title.trim().startsWith(TRANSLATED_PAGE_PREFIX);
+  function shouldTranslateAssessmentString(pathStack, value = "") {
+    const pathText = pathStack.join(".");
+    const leafKey = getLastNonNumericPathPart(pathStack);
+
+    if (!value || !value.trim()) {
+      return false;
+    }
+
+    if (pathText.includes(".metadata.")) {
+      return false;
+    }
+
+    if (pathText.includes(".showGuidanceAfterResponseOption.")) {
+      return false;
+    }
+
+    if (pathText.includes(".showExpectedAnswerOption.")) {
+      return false;
+    }
+
+    if (pathText.includes(".options.")) {
+      return false;
+    }
+
+    if (pathText.includes(".opened.")) {
+      return false;
+    }
+
+    if (pathText.includes(".files.")) {
+      return false;
+    }
+
+    const neverTranslateKeys = new Set([
+      "id",
+      "_id",
+      "taskId",
+      "type",
+      "command",
+      "preExecuteCommand",
+      "path",
+      "content",
+      "action",
+      "value"
+    ]);
+
+    if (neverTranslateKeys.has(leafKey)) {
+      return false;
+    }
+
+    if (leafKey === "name" && !TRANSLATE_ASSESSMENT_SOURCE_NAME) {
+      return false;
+    }
+
+    const allowedKeys = new Set([
+      "title",
+      "instructions",
+      "guidance",
+      "learningObjectives",
+      "text",
+      "blank",
+      "answer",
+      "feedback",
+      "output",
+      "question",
+      "prompt",
+      "hint",
+      "description",
+      "explanation",
+      "name",
+      "distractors",
+      "placeholder",
+      "label"
+    ]);
+
+    return allowedKeys.has(leafKey);
   }
 
-  async function translatePageTitle(title) {
+  function getLastNonNumericPathPart(pathStack) {
+    for (let index = pathStack.length - 1; index >= 0; index--) {
+      if (!/^\d+$/.test(pathStack[index])) {
+        return pathStack[index];
+      }
+    }
+    return "";
+  }
+
+  async function translateTitle(title, contextLabel) {
     const prompt = `
-Translate this Codio Guides page title from ${SOURCE_LANGUAGE} to ${TARGET_LANGUAGE}.
+Translate this visible Codio Guides title from ${SOURCE_LANGUAGE} to ${TARGET_LANGUAGE}.
 
 Rules:
 1. Translate naturally into German.
 2. Do not add quotation marks.
-3. Do not add a prefix like [DE]; that is handled separately.
+3. Do not add commentary.
 4. Return only the translated title inside <translated_title> tags.
+
+<context>
+${contextLabel}
+</context>
 
 <original_title>
 ${title}
@@ -130,116 +276,154 @@ ${title}
 <translated_title>
     `.trim();
 
-    const translated = await askAndExtractXmlTag(prompt, "translated_title");
+    const translated = await askForXmlTag(prompt, "translated_title");
     return translated || title;
   }
 
-  async function translateGuideContent(content, pageTitle) {
-    if (!content || !content.trim()) {
-      return content;
+  async function translateRichText(text, contextLabel) {
+    if (!text || !text.trim()) {
+      return text;
     }
+
+    const frozen = freezeContent(text);
 
     const prompt = `
-Translate the following Codio Guides page from ${SOURCE_LANGUAGE} to ${TARGET_LANGUAGE}.
-
-Page title:
-${pageTitle}
+Translate the following learner-facing content from ${SOURCE_LANGUAGE} to ${TARGET_LANGUAGE}.
 
 Rules:
-1. Translate all learner-facing prose into German.
-2. Preserve Markdown structure exactly.
-3. Preserve HTML structure and attributes exactly.
-4. Preserve URLs, image paths, file paths, placeholders, variables, macros, and template syntax exactly.
-5. Preserve fenced code blocks, inline code, commands, package names, API names, filenames, and source code exactly.
-6. Translate visible link text, headings, paragraphs, bullet text, table text, and callout text where safe.
-7. Do not add explanations, notes, or extra content.
-8. Return only the translated page inside <translated_content> tags.
+1. Translate human-readable instructional text into German.
+2. Preserve all placeholder tokens exactly as written, including any token that starts with __FROZEN_.
+3. Preserve markdown structure.
+4. Preserve HTML tags and attributes.
+5. Preserve URLs, file paths, commands, filenames, IDs, and executable content.
+6. Preserve anything inside fenced code blocks and inline code.
+7. Preserve <<< and >>> delimiters exactly, but you may translate the human text inside them.
+8. For Codio macros like {Label|assessment}(task-id) or {Label}(command), only the visible label should be translated. The macro syntax itself must remain unchanged.
+9. Do not add explanations, notes, or extra text.
+10. Return only the translated content inside <translated_text> tags.
 
-<original_content>
-${content}
-</original_content>
+<context>
+${contextLabel}
+</context>
 
-<translated_content>
+<original_text>
+${frozen.text}
+</original_text>
+
+<translated_text>
     `.trim();
 
-    const translated = await askAndExtractXmlTag(prompt, "translated_content");
-    return translated || content;
+    const translatedFrozenText = await askForXmlTag(prompt, "translated_text");
+    const restored = await restoreContent(translatedFrozenText || frozen.text, frozen);
+
+    return restored;
   }
 
-  async function maybeTranslateOpenTextFile(actions) {
-    const fileActionIndex = actions.findIndex(
-      (action) =>
-        action &&
-        action.type === "file" &&
-        typeof action.fileName === "string" &&
-        action.fileName.trim() !== ""
-    );
+  function freezeContent(text) {
+    let working = text;
 
-    if (fileActionIndex === -1) {
-      return actions;
-    }
+    const frozenBlocks = [];
+    const markdownTargets = [];
+    const codioMacros = [];
 
-    const sourcePath = actions[fileActionIndex].fileName;
+    working = working.replace(/```[\s\S]*?```/g, (match) => {
+      const token = `__FROZEN_BLOCK_${frozenBlocks.length}__`;
+      frozenBlocks.push({ token, value: match });
+      return token;
+    });
 
-    if (!isTranslatableTextFile(sourcePath)) {
-      return actions;
-    }
+    working = working.replace(/`[^`\n]+`/g, (match) => {
+      const token = `__FROZEN_INLINE_${frozenBlocks.length}__`;
+      frozenBlocks.push({ token, value: match });
+      return token;
+    });
 
-    try {
-      const sourceContent = await codioIDE.files.getContent(sourcePath);
-      const translatedContent = await translateTextFile(sourceContent, sourcePath);
-      const translatedPath = buildTranslatedFilePath(sourcePath);
+    working = working.replace(/(!?\[[^\]]*?\])\(([^)]+)\)/g, (match, prefix, target) => {
+      const token = `__FROZEN_TARGET_${markdownTargets.length}__`;
+      markdownTargets.push({ token, value: target });
+      return `${prefix}(${token})`;
+    });
 
-      try {
-        await codioIDE.files.add(translatedPath, translatedContent);
-      } catch (addError) {
-        // If the file already exists, keep going and just point the page action at it.
-        console.warn(`Could not create translated file at ${translatedPath}:`, addError);
-      }
+    working = working.replace(/\{([^{}]+)\}\(([^)]+)\)/g, (match, inner, target) => {
+      const token = `__FROZEN_MACRO_${codioMacros.length}__`;
+      codioMacros.push({ token, inner, target });
+      return token;
+    });
 
-      const updatedActions = [...actions];
-      updatedActions[fileActionIndex] = {
-        ...updatedActions[fileActionIndex],
-        fileName: translatedPath
-      };
-
-      return updatedActions;
-    } catch (fileError) {
-      console.warn(`Could not translate open text file "${sourcePath}":`, fileError);
-      return actions;
-    }
+    return {
+      text: working,
+      frozenBlocks,
+      markdownTargets,
+      codioMacros
+    };
   }
 
-  async function translateTextFile(content, filePath) {
-    if (!content || !content.trim()) {
-      return content;
+  async function restoreContent(text, frozen) {
+    let working = text;
+
+    for (const macro of frozen.codioMacros) {
+      const rebuilt = await rebuildCodioMacro(macro);
+      working = replaceAllLiteral(working, macro.token, rebuilt);
     }
 
+    for (const target of frozen.markdownTargets) {
+      working = replaceAllLiteral(working, target.token, target.value);
+    }
+
+    for (const block of frozen.frozenBlocks) {
+      working = replaceAllLiteral(working, block.token, block.value);
+    }
+
+    return working;
+  }
+
+  async function rebuildCodioMacro(macro) {
+    const pipeIndex = macro.inner.indexOf("|");
+
+    let label = macro.inner;
+    let suffix = "";
+
+    if (pipeIndex !== -1) {
+      label = macro.inner.slice(0, pipeIndex);
+      suffix = macro.inner.slice(pipeIndex);
+    }
+
+    const translatedLabel = shouldTranslateMacroLabel(label)
+      ? await translateShortLabel(label)
+      : label;
+
+    return `{${translatedLabel}${suffix}}(${macro.target})`;
+  }
+
+  function shouldTranslateMacroLabel(label) {
+    if (!label || !label.trim()) {
+      return false;
+    }
+
+    return /[A-Za-z]/.test(label);
+  }
+
+  async function translateShortLabel(label) {
     const prompt = `
-Translate this text-based file from ${SOURCE_LANGUAGE} to ${TARGET_LANGUAGE}.
-
-File path:
-${filePath}
+Translate this short visible UI label from ${SOURCE_LANGUAGE} to ${TARGET_LANGUAGE}.
 
 Rules:
-1. Translate learner-facing text into German.
-2. Preserve Markdown structure exactly.
-3. Preserve fenced code blocks, inline code, commands, URLs, placeholders, variables, and filenames exactly.
-4. Do not add explanations, notes, or extra content.
-5. Return only the translated file contents inside <translated_file> tags.
+1. Translate naturally.
+2. Keep it concise.
+3. Return only the translated label inside <translated_label> tags.
 
-<original_file>
-${content}
-</original_file>
+<original_label>
+${label}
+</original_label>
 
-<translated_file>
+<translated_label>
     `.trim();
 
-    const translated = await askAndExtractXmlTag(prompt, "translated_file");
-    return translated || content;
+    const translated = await askForXmlTag(prompt, "translated_label");
+    return translated || label;
   }
 
-  async function askAndExtractXmlTag(userPrompt, xmlTag) {
+  async function askForXmlTag(userPrompt, xmlTag) {
     const result = await codioIDE.coachBot.ask(
       {
         systemPrompt,
@@ -256,7 +440,7 @@ ${content}
       }
     );
 
-    const raw = result?.result || "";
+    const raw = result && typeof result.result === "string" ? result.result : "";
     return extractXmlTagContents(raw, xmlTag).trim();
   }
 
@@ -274,36 +458,161 @@ ${content}
     return text.substring(startIndex + startTag.length, endIndex);
   }
 
-  function isTranslatableTextFile(filePath) {
-    const extension = getFileExtension(filePath);
-    return TRANSLATABLE_TEXT_FILE_EXTENSIONS.has(extension);
+  function replaceAllLiteral(text, search, replacement) {
+    return text.split(search).join(replacement);
   }
 
-  function getFileExtension(filePath) {
-    const fileName = filePath.split("/").pop() || "";
-    const lastDot = fileName.lastIndexOf(".");
-    if (lastDot === -1) {
+  async function walk(dirPath) {
+    const entries = await listDirectory(dirPath);
+    const results = [];
+
+    for (const entry of entries) {
+      const entryPath = normalizeEntryPath(dirPath, entry);
+      const isDirectory = entryIsDirectory(entry);
+
+      if (!entryPath) {
+        continue;
+      }
+
+      if (isDirectory) {
+        const nested = await walk(entryPath);
+        results.push(...nested);
+      } else {
+        results.push(entryPath);
+      }
+    }
+
+    return results;
+  }
+
+  function normalizeEntryPath(parentPath, entry) {
+    if (!entry) {
       return "";
     }
-    return fileName.slice(lastDot).toLowerCase();
+
+    if (typeof entry === "string") {
+      return normalizePath(entry);
+    }
+
+    if (typeof entry.path === "string" && entry.path.trim()) {
+      return normalizePath(entry.path);
+    }
+
+    if (typeof entry.name === "string" && entry.name.trim()) {
+      return normalizePath(`${parentPath}/${entry.name}`);
+    }
+
+    if (typeof entry.title === "string" && entry.title.trim()) {
+      return normalizePath(`${parentPath}/${entry.title}`);
+    }
+
+    return "";
   }
 
-  function buildTranslatedFilePath(filePath) {
-    const lastSlash = filePath.lastIndexOf("/");
-    const directory = lastSlash === -1 ? "" : filePath.slice(0, lastSlash + 1);
-    const fileName = lastSlash === -1 ? filePath : filePath.slice(lastSlash + 1);
-
-    if (fileName.includes(".de.")) {
-      return filePath;
+  function entryIsDirectory(entry) {
+    if (!entry || typeof entry !== "object") {
+      return false;
     }
 
-    const lastDot = fileName.lastIndexOf(".");
-    if (lastDot === -1) {
-      return `${directory}${fileName}.de`;
+    return (
+      entry.isDirectory === true ||
+      entry.directory === true ||
+      entry.type === "directory" ||
+      entry.type === "folder"
+    );
+  }
+
+  function normalizePath(path) {
+    return path.replace(/\/+/g, "/").replace(/\/$/, "");
+  }
+
+  async function listDirectory(path) {
+    // Keep this helper isolated because runtime naming can differ.
+    if (codioIDE.files && typeof codioIDE.files.list === "function") {
+      const result = await codioIDE.files.list(path);
+      return normalizeDirectoryListing(result);
     }
 
-    const baseName = fileName.slice(0, lastDot);
-    const extension = fileName.slice(lastDot);
-    return `${directory}${baseName}.de${extension}`;
+    if (codioIDE.files && typeof codioIDE.files.getFolderContents === "function") {
+      const result = await codioIDE.files.getFolderContents(path);
+      return normalizeDirectoryListing(result);
+    }
+
+    if (window.codioIDE && window.codioIDE.files && typeof window.codioIDE.files.list === "function") {
+      const result = await window.codioIDE.files.list(path);
+      return normalizeDirectoryListing(result);
+    }
+
+    throw new Error(
+      "No supported directory listing API was found. Update listDirectory() to match your Codio extension runtime."
+    );
+  }
+
+  function normalizeDirectoryListing(result) {
+    if (Array.isArray(result)) {
+      return result;
+    }
+
+    if (result && Array.isArray(result.files)) {
+      return result.files;
+    }
+
+    if (result && Array.isArray(result.children)) {
+      return result.children;
+    }
+
+    return [];
+  }
+
+  async function readFile(path) {
+    if (codioIDE.files && typeof codioIDE.files.getContent === "function") {
+      return await codioIDE.files.getContent(path);
+    }
+
+    if (window.codioIDE && window.codioIDE.files && typeof window.codioIDE.files.getContent === "function") {
+      return await window.codioIDE.files.getContent(path);
+    }
+
+    throw new Error(`No supported read API was found for ${path}.`);
+  }
+
+  async function writeFile(path, content) {
+    if (DRY_RUN) {
+      console.log(`[DRY RUN] Would write ${path}`);
+      return;
+    }
+
+    if (codioIDE.files && typeof codioIDE.files.setContent === "function") {
+      await codioIDE.files.setContent(path, content);
+      return;
+    }
+
+    if (codioIDE.files && typeof codioIDE.files.write === "function") {
+      await codioIDE.files.write(path, content);
+      return;
+    }
+
+    if (window.codioIDE && window.codioIDE.files && typeof window.codioIDE.files.setContent === "function") {
+      await window.codioIDE.files.setContent(path, content);
+      return;
+    }
+
+    if (codioIDE.files && typeof codioIDE.files.add === "function") {
+      try {
+        await codioIDE.files.add(path, content, { overwrite: true });
+        return;
+      } catch (error) {
+        // Fall through to the explicit error below.
+      }
+    }
+
+    throw new Error(
+      `No supported write API was found for ${path}. Update writeFile() to match your Codio extension runtime.`
+    );
+  }
+
+  async function writeJson(path, objectValue) {
+    const serialized = JSON.stringify(objectValue, null, "\t");
+    await writeFile(path, serialized);
   }
 })(window.codioIDE, window);
