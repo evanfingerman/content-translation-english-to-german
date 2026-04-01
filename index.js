@@ -1,6 +1,6 @@
 (async function (codioIDE, window) {
   const BUTTON_ID = "translateGuidesInPlaceGerman";
-  const BUTTON_LABEL = "Translate this assignment into German";
+  const BUTTON_LABEL = "English to German";
   const ROOT_GUIDES_PATH = ".guides";
 
   const SOURCE_LANGUAGE = "English";
