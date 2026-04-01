@@ -1,6 +1,6 @@
 (async function (codioIDE, window) {
   const BUTTON_ID = "translateGuidesInPlaceGerman";
-  const BUTTON_LABEL = "English to German";
+  const BUTTON_LABEL = "Translate English to German";
   const ROOT_GUIDES_PATH = ".guides";
 
   const SOURCE_LANGUAGE = "English";
@@ -23,10 +23,7 @@ Return only the requested XML tag contents.
   codioIDE.coachBot.register(BUTTON_ID, BUTTON_LABEL, onButtonPress);
 
   async function onButtonPress() {
-    try {
-      codioIDE.coachBot.write("NEW IN-PLACE BUILD LOADED");
-      throw new Error("NEW IN-PLACE BUILD LOADED");
-      
+    try {     
       codioIDE.coachBot.write("Scanning .guides files...");
 
       const allPaths = (await walk(ROOT_GUIDES_PATH)).sort();
