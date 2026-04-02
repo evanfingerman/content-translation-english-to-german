@@ -554,38 +554,36 @@ ${label}
       return;
     }
   
-    if (codioIDE.files && typeof codioIDE.files.deleteFiles === "function" &&
-        codioIDE.files && typeof codioIDE.files.add === "function") {
-      try {
-        await codioIDE.files.deleteFiles([path]);
-      } catch (error) {
-        // Ignore delete failure in case the file does not exist yet.
-      }
+    const api =
+      (codioIDE && codioIDE.remoteCommand) ||
+      (window.codioIDE && window.codioIDE.remoteCommand);
   
-      await codioIDE.files.add(path, content);
-      return;
+    if (!api || typeof api.run !== "function") {
+      throw new Error(`No supported write API was found for ${path}.`);
     }
   
-    if (window.codioIDE && window.codioIDE.files &&
-        typeof window.codioIDE.files.deleteFiles === "function" &&
-        typeof window.codioIDE.files.add === "function") {
-      try {
-        await window.codioIDE.files.deleteFiles([path]);
-      } catch (error) {
-        // Ignore delete failure in case the file does not exist yet.
-      }
+    const base64Content = toBase64Utf8(content);
+    const escapedPath = shellQuote(path);
   
-      await window.codioIDE.files.add(path, content);
-      return;
-    }
+    const command = [
+      "bash",
+      "-lc",
+      `mkdir -p "$(dirname ${escapedPath})" && printf '%s' '${base64Content}' | base64 -d > ${escapedPath}`
+    ];
   
-    throw new Error(
-      `No supported write API was found for ${path}.`
-    );
+    await api.run(command);
   }
-
-  async function writeJson(path, objectValue) {
-    const serialized = JSON.stringify(objectValue, null, "\t");
-    await writeFile(path, serialized);
+  
+  function shellQuote(value) {
+    return `'${String(value).replace(/'/g, `'\"'\"'`)}'`;
+  }
+  
+  function toBase64Utf8(text) {
+    const bytes = new TextEncoder().encode(text);
+    let binary = "";
+    for (const byte of bytes) {
+      binary += String.fromCharCode(byte);
+    }
+    return btoa(binary);
   }
 })(window.codioIDE, window);
