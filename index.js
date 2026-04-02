@@ -553,33 +553,34 @@ ${label}
       console.log(`[DRY RUN] Would write ${path}`);
       return;
     }
-
-    if (codioIDE.files && typeof codioIDE.files.setContent === "function") {
-      await codioIDE.files.setContent(path, content);
-      return;
-    }
-
-    if (codioIDE.files && typeof codioIDE.files.write === "function") {
-      await codioIDE.files.write(path, content);
-      return;
-    }
-
-    if (window.codioIDE && window.codioIDE.files && typeof window.codioIDE.files.setContent === "function") {
-      await window.codioIDE.files.setContent(path, content);
-      return;
-    }
-
-    if (codioIDE.files && typeof codioIDE.files.add === "function") {
+  
+    if (codioIDE.files && typeof codioIDE.files.deleteFiles === "function" &&
+        codioIDE.files && typeof codioIDE.files.add === "function") {
       try {
-        await codioIDE.files.add(path, content, { overwrite: true });
-        return;
+        await codioIDE.files.deleteFiles([path]);
       } catch (error) {
-        // Fall through to the explicit error below.
+        // Ignore delete failure in case the file does not exist yet.
       }
+  
+      await codioIDE.files.add(path, content);
+      return;
     }
-
+  
+    if (window.codioIDE && window.codioIDE.files &&
+        typeof window.codioIDE.files.deleteFiles === "function" &&
+        typeof window.codioIDE.files.add === "function") {
+      try {
+        await window.codioIDE.files.deleteFiles([path]);
+      } catch (error) {
+        // Ignore delete failure in case the file does not exist yet.
+      }
+  
+      await window.codioIDE.files.add(path, content);
+      return;
+    }
+  
     throw new Error(
-      `No supported write API was found for ${path}. Update writeFile() to match your Codio extension runtime.`
+      `No supported write API was found for ${path}.`
     );
   }
 
