@@ -26,19 +26,11 @@ Return only the requested XML tag contents.
     try {     
       codioIDE.coachBot.write("Scanning .guides files...");
 
-      const allPaths = (await walk(ROOT_GUIDES_PATH)).sort();
-
-      const contentJsonPaths = allPaths.filter(
-        (path) => path.startsWith(".guides/content/") && path.endsWith(".json")
-      );
-
-      const contentMarkdownPaths = allPaths.filter(
-        (path) => path.startsWith(".guides/content/") && path.endsWith(".md")
-      );
-
-      const assessmentJsonPaths = allPaths.filter(
-        (path) => path.startsWith(".guides/assessments/") && path.endsWith(".json")
-      );
+      const {
+        contentJsonPaths,
+        contentMarkdownPaths,
+        assessmentJsonPaths
+      } = await discoverGuidesPaths();
 
       codioIDE.coachBot.write(
         `Found ${contentJsonPaths.length} content JSON files, ${contentMarkdownPaths.length} content markdown files, and ${assessmentJsonPaths.length} assessment JSON files.`
@@ -74,6 +66,88 @@ Return only the requested XML tag contents.
     }
   }
 
+  async function discoverGuidesPaths() {
+    const contentJsonPaths = [];
+    const contentMarkdownPaths = [];
+    const assessmentJsonPathSet = new Set();
+  
+    await collectContentNode(
+      `${ROOT_GUIDES_PATH}/content`,
+      contentJsonPaths,
+      contentMarkdownPaths,
+      assessmentJsonPathSet
+    );
+  
+    return {
+      contentJsonPaths: contentJsonPaths.sort(),
+      contentMarkdownPaths: contentMarkdownPaths.sort(),
+      assessmentJsonPaths: Array.from(assessmentJsonPathSet).sort()
+    };
+  }
+  
+  async function collectContentNode(
+    folderPath,
+    contentJsonPaths,
+    contentMarkdownPaths,
+    assessmentJsonPathSet
+  ) {
+    const indexPath = `${folderPath}/index.json`;
+    const indexRaw = await readFile(indexPath);
+    const indexData = JSON.parse(indexRaw);
+  
+    contentJsonPaths.push(indexPath);
+  
+    const order = Array.isArray(indexData.order) ? indexData.order : [];
+  
+    for (const slug of order) {
+      const pageJsonPath = `${folderPath}/${slug}.json`;
+  
+      if (await fileExists(pageJsonPath)) {
+        contentJsonPaths.push(pageJsonPath);
+  
+        const pageMdPath = `${folderPath}/${slug}.md`;
+        if (await fileExists(pageMdPath)) {
+          contentMarkdownPaths.push(pageMdPath);
+  
+          const markdown = await readFile(pageMdPath);
+          for (const taskId of extractAssessmentTaskIds(markdown)) {
+            assessmentJsonPathSet.add(`${ROOT_GUIDES_PATH}/assessments/${taskId}.json`);
+          }
+        }
+  
+        continue;
+      }
+  
+      await collectContentNode(
+        `${folderPath}/${slug}`,
+        contentJsonPaths,
+        contentMarkdownPaths,
+        assessmentJsonPathSet
+      );
+    }
+  }
+  
+  async function fileExists(path) {
+    try {
+      await readFile(path);
+      return true;
+    } catch (error) {
+      return false;
+    }
+  }
+  
+  function extractAssessmentTaskIds(markdown) {
+    const ids = new Set();
+    const regex = /\{[^{}]+\|assessment\}\(([^)]+)\)/g;
+  
+    let match;
+    while ((match = regex.exec(markdown)) !== null) {
+      ids.add(match[1].trim());
+    }
+  
+    return Array.from(ids);
+  }
+  
   async function translateContentJsonFile(path) {
     const raw = await readFile(path);
     const data = JSON.parse(raw);
@@ -137,9 +211,9 @@ Return only the requested XML tag contents.
       for (let index = 0; index < node.length; index++) {
         const value = node[index];
         const nextPath = [...pathStack, String(index)];
-
+  
         if (typeof value === "string") {
-          if (shouldTranslateAssessmentString(nextPath)) {
+          if (shouldTranslateAssessmentString(nextPath, value)) {
             node[index] = await translateRichText(value, nextPath.join("."));
           }
         } else if (value && typeof value === "object") {
@@ -148,21 +222,21 @@ Return only the requested XML tag contents.
       }
       return;
     }
-
+  
     if (!node || typeof node !== "object") {
       return;
     }
-
+  
     for (const [key, value] of Object.entries(node)) {
       const nextPath = [...pathStack, key];
-
+  
       if (typeof value === "string") {
         if (shouldTranslateAssessmentString(nextPath, value)) {
           node[key] = await translateRichText(value, nextPath.join("."));
         }
         continue;
       }
-
+  
       if (value && typeof value === "object") {
         await translateAssessmentNode(value, nextPath);
       }
@@ -460,108 +534,6 @@ ${label}
 
   function replaceAllLiteral(text, search, replacement) {
     return text.split(search).join(replacement);
-  }
-
-  async function walk(dirPath) {
-    const entries = await listDirectory(dirPath);
-    const results = [];
-
-    for (const entry of entries) {
-      const entryPath = normalizeEntryPath(dirPath, entry);
-      const isDirectory = entryIsDirectory(entry);
-
-      if (!entryPath) {
-        continue;
-      }
-
-      if (isDirectory) {
-        const nested = await walk(entryPath);
-        results.push(...nested);
-      } else {
-        results.push(entryPath);
-      }
-    }
-
-    return results;
-  }
-
-  function normalizeEntryPath(parentPath, entry) {
-    if (!entry) {
-      return "";
-    }
-
-    if (typeof entry === "string") {
-      return normalizePath(entry);
-    }
-
-    if (typeof entry.path === "string" && entry.path.trim()) {
-      return normalizePath(entry.path);
-    }
-
-    if (typeof entry.name === "string" && entry.name.trim()) {
-      return normalizePath(`${parentPath}/${entry.name}`);
-    }
-
-    if (typeof entry.title === "string" && entry.title.trim()) {
-      return normalizePath(`${parentPath}/${entry.title}`);
-    }
-
-    return "";
-  }
-
-  function entryIsDirectory(entry) {
-    if (!entry || typeof entry !== "object") {
-      return false;
-    }
-
-    return (
-      entry.isDirectory === true ||
-      entry.directory === true ||
-      entry.type === "directory" ||
-      entry.type === "folder"
-    );
-  }
-
-  function normalizePath(path) {
-    return path.replace(/\/+/g, "/").replace(/\/$/, "");
-  }
-
-  async function listDirectory(path) {
-    // Keep this helper isolated because runtime naming can differ.
-    if (codioIDE.files && typeof codioIDE.files.list === "function") {
-      const result = await codioIDE.files.list(path);
-      return normalizeDirectoryListing(result);
-    }
-
-    if (codioIDE.files && typeof codioIDE.files.getFolderContents === "function") {
-      const result = await codioIDE.files.getFolderContents(path);
-      return normalizeDirectoryListing(result);
-    }
-
-    if (window.codioIDE && window.codioIDE.files && typeof window.codioIDE.files.list === "function") {
-      const result = await window.codioIDE.files.list(path);
-      return normalizeDirectoryListing(result);
-    }
-
-    throw new Error(
-      "No supported directory listing API was found. Update listDirectory() to match your Codio extension runtime."
-    );
-  }
-
-  function normalizeDirectoryListing(result) {
-    if (Array.isArray(result)) {
-      return result;
-    }
-
-    if (result && Array.isArray(result.files)) {
-      return result.files;
-    }
-
-    if (result && Array.isArray(result.children)) {
-      return result.children;
-    }
-
-    return [];
   }
 
   async function readFile(path) {
